@@ -885,10 +885,24 @@ TextBuffer::SaveResult TextBuffer::saveBufferUnprivileged(const QString &filenam
     if (!saveFile->open(QIODevice::WriteOnly)) {
 #ifdef CAN_USE_ERRNO
         if (errno != EACCES) {
+            // some other, non permission related error
             return SAVE_FAILED;
         }
-#endif
+
+        auto new_dev = tryForceOpen(filename);
+
+        if (!new_dev) {
+            // couldn't recover from permissions problems
+            return SAVE_NO_PERMS;
+        }
+
+        // assign new, successfully opened device
+        saveFile.reset(new_dev);
+#else
+        // this platform can't determine the reason for failed open() so
+        // consider this a permissions problem.
         return SAVE_NO_PERMS;
+#endif
     }
 
     if (!saveBuffer(filename, *saveFile)) {
@@ -896,6 +910,85 @@ TextBuffer::SaveResult TextBuffer::saveBufferUnprivileged(const QString &filenam
     }
 
     return SAVE_SUCCESS;
+}
+
+KCompressionDevice* TextBuffer::tryForceOpen(const QString &filename)
+{
+        const QFileInfo info(filename);
+        // explicitly construct a canonical path to be on the safe side, since
+        // otherwise we might remove a symlink instead of its read-only target
+        const auto canonicalFilename = info.canonicalFilePath();
+        // force retrieval of information before we remove/recreate the file
+        // below. The semantics of QFileInfo are a bit strange ... there seems
+        // to be no way to fetch the info right away
+        (void)info.permissions();
+        QScopedPointer<QFile> file(new QFile(canonicalFilename));
+
+        if (!file->remove()) {
+            return NULL;
+        }
+
+        // the file was probably marked read-only, we managed to remove
+        // it, opening should now be possible. Note that removing the file
+        // should not be an issue, since if the first open() with
+        // WriteOnly would have succeeded, it would have been truncated
+        // anyways.
+        //
+        // TODO: if the directory this happens in is also read-only then
+        // this case isn't catched yet and we still escalate privileges
+        // unnecessarily.
+        //
+        // TODO: the user should actually be warned (again) before
+        // overwriting a read-only file (which is supposedly somehow
+        // important)
+
+        if (!file->open(QIODevice::WriteOnly)) {
+            // this shouldn't still fail to open (except on race conditions
+            // with other file system operations)
+            return NULL;
+        }
+
+	// try to reapply the original permissions, QFile does not support
+	// specification of permissions during open, sadly.
+        (void)applyPermissions(*file, info);
+
+        const KCompressionDevice::CompressionType type =
+            KFilterDev::compressionTypeForMimeType(m_mimeTypeForFilterDev);
+
+        auto ret = new KCompressionDevice(file.take(), true /* auto delete */, type);
+
+        ret->open(QIODevice::WriteOnly);
+
+        return ret;
+}
+
+bool TextBuffer::applyPermissions(QFile &file, const QFileInfo &info)
+{
+        bool ret = true;
+
+        if (!file.setPermissions(info.permissions())) {
+            // this really shouldn't happen but we can try to continue
+            // anyways
+            BUFFER_DEBUG << "Failed to reapply permissions: " << file.errorString();
+            ret = false;
+        }
+
+#ifndef Q_OS_WIN
+        // no wrappers for chown()/chgrp() available in Qt, so do it
+        // directly
+        if (fchown(file.handle(), info.ownerId(), info.groupId()) == -1) {
+            // well, nothing much we can do about it
+            //
+            // only root should be able to change the owner, but if we
+            // have been able to remove the original file then the
+            // owner should be correct already (except for exotic
+            // cases like world-writeable directories).
+            BUFFER_DEBUG << "Failed to restore ownership via fchown(): errno = " << errno;
+            ret = false;
+        }
+#endif
+
+        return ret;
 }
 
 bool TextBuffer::saveBufferEscalated(const QString &filename)

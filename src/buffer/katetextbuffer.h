@@ -40,6 +40,8 @@
 #include <KEncodingProber>
 
 class KCompressionDevice;
+class QFile;
+class QFileInfo;
 
 namespace Kate
 {
@@ -498,6 +500,20 @@ private:
      * current privileges.
      */
     SaveResult saveBufferUnprivileged(const QString &filename);
+
+    /**
+     * Attempt to open the given file for writing when a regular open()
+     * doesn't work e.g. in case of read-only files.
+     * \return A pointer to the successfully opened file (ownership is
+     * transferred to caller) or NULL on error.
+     */
+    KCompressionDevice* tryForceOpen(const QString &filename);
+
+    /**
+     * Attempt to apply relevant permission metadata from the given info
+     * object to the given open file.
+     */
+    bool applyPermissions(QFile &file, const QFileInfo &info);
 
     /**
      * Attempt to save the buffer content in the given filename location using
